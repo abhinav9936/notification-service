@@ -1,5 +1,9 @@
 HELP.md
 target/
+
+# Held out of tracking intentionally -- add back and commit before final push (assignment
+# requires it in the submitted repo). See CLAUDE.md itself for the note.
+CLAUDE.md
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
