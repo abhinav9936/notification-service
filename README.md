@@ -5,8 +5,10 @@ channels, and send immediate or scheduled notifications (email/SMS/push/in-app),
 rate limiting, retries with exponential backoff on transient failures, and a persisted audit trail
 of every delivery attempt.
 
-Full original requirements: [`docs/assignment.md`](docs/assignment.md). Design rationale and build
-order: [`docs/plan.md`](docs/plan.md).
+Full original requirements: [`docs/assignment.md`](docs/assignment.md). Design docs:
+[`docs/HLD.md`](docs/HLD.md) (architecture, components, data flow) and [`docs/LLD.md`](docs/LLD.md)
+(schema, algorithms, class-level detail). Original design plan / build order (written before
+implementation): [`docs/plan.md`](docs/plan.md).
 
 ## Tech stack
 
@@ -52,78 +54,22 @@ schema created fresh via `ddl-auto=create-drop` each run) so tests never touch d
 
 ## Architecture
 
-### Domain model
+The full design write-up lives in two dedicated documents rather than here, so each can go into
+proper depth without turning this README into a wall of text:
 
-- **Tenant** — a customer organization (`ACTIVE`/`SUSPENDED`).
-- **AppUser** — a login account; `PLATFORM_ADMIN` (no tenant) or `TENANT_ADMIN` (belongs to exactly one tenant).
-- **NotificationTemplate** — tenant-owned; a channel + subject/body with `{{variable}}` placeholders.
-- **ChannelConfig** — tenant-owned; per-channel enabled flag + a simulated provider name.
-- **GlobalRateLimitConfig** / **TenantRateLimit** — platform default and optional per-tenant override.
-- **NotificationRequest** — one logical send: tenant, channel, recipient, rendered content,
-  idempotency key, status, retry bookkeeping (`attemptCount`, `maxAttempts`, `nextAttemptAt`).
-- **DeliveryAttempt** — one attempt at delivering a `NotificationRequest` (outcome, error, timestamp)
-  — this is the audit trail.
+- **[`docs/HLD.md`](docs/HLD.md)** — actors, system context, major components, the core "send a
+  notification" data flow, and the non-functional decisions (concurrency, fairness, rate limiting,
+  retries, security) with their reasoning.
+- **[`docs/LLD.md`](docs/LLD.md)** — table-by-table schema, the exact claim query (`SELECT ... FOR
+  UPDATE SKIP LOCKED`) and why per-tenant batching gives fairness, the token-bucket and backoff
+  formulas, the exception hierarchy, and a few Spring pitfalls hit and fixed along the way (a CSRF
+  gotcha, a missing `@Bean`, a `@Transactional` self-invocation issue).
 
-### Status lifecycle
-
-```
-SCHEDULED --(scheduledAt due)--> PENDING --(claimed)--> PROCESSING
-PROCESSING --(success)--> SENT
-PROCESSING --(transient failure, attempts remain)--> RETRY_PENDING --(backoff elapses)--> PROCESSING
-PROCESSING --(transient failure, attempts exhausted)--> DEAD
-```
-
-### Concurrency & fairness
-
-A single `@Scheduled` poller (every 2s, `NotificationDispatchService`) drives dispatch:
-
-1. Promotes any `SCHEDULED` row whose `scheduledAt` has passed to `PENDING`.
-2. Finds which tenants currently have claimable work (`PENDING`, or `RETRY_PENDING` whose backoff
-   has elapsed).
-3. For **each tenant** (not globally), reserves up to 5 rate-limit permits and claims that many rows
-   via `SELECT ... FOR UPDATE SKIP LOCKED` (`NotificationClaimService`), immediately flipping them
-   to `PROCESSING` in the same transaction.
-4. Hands each claimed row to the worker pool for its channel (`AsyncExecutorConfig`: one bounded
-   `ThreadPoolTaskExecutor` per channel).
-
-**Why per-tenant, not one global batch:** claiming a fixed batch *per tenant* rather than one global
-`ORDER BY created_at LIMIT N` is what gives per-tenant fairness — a tenant that just enqueued 10,000
-notifications can only ever claim 5 per poll cycle, so it can't starve other tenants out of the same
-cycle. **Why `SKIP LOCKED`:** it lets concurrent claim attempts skip rows another transaction already
-has locked instead of blocking on them, so no two workers can ever process the same row twice.
-
-### Retries & backoff
-
-On failure, `attemptCount` increments and a `DeliveryAttempt(FAILURE)` is recorded. If attempts remain,
-status becomes `RETRY_PENDING` with `nextAttemptAt = now + min(2s * 2^(attempt-1), 60s)` (exponential,
-capped). Once `maxAttempts` (default 5) is exhausted, status becomes `DEAD`. Every attempt — success
-or failure — is persisted, satisfying the audit-trail requirement.
-
-### Avoiding duplicate deliveries
-
-Two distinct mechanisms:
-- **Client-side retries** (the caller resubmits the same logical send): `idempotencyKey` is unique
-  per tenant. Resubmitting the same key returns the existing `NotificationRequest` instead of
-  creating a new one.
-- **Internal retries** (our own backoff loop): a retry never creates a new row — it's the same
-  `NotificationRequest`, re-claimed and re-attempted, with a new `DeliveryAttempt` appended. Combined
-  with the `SKIP LOCKED` claiming above, a row is never picked up by two workers at once.
-
-### Channel sending
-
-Real provider integration (Twilio/SendGrid/APNs/etc.) is out of scope for this assignment.
-`SimulatedChannelSender` stands in for it: a recipient address containing `"fail"` (case-insensitive)
-always fails, everything else always succeeds. This is deliberately deterministic rather than
-randomly flaky, so retry/backoff/dead-letter behavior is reproducible on demand for testing and demos.
-
-### RBAC
-
-- `PLATFORM_ADMIN`: manage tenants, create tenant-admin accounts, set the platform-wide default rate limit.
-- `TENANT_ADMIN`: manage their own tenant's templates/channel configs/rate-limit override, send
-  notifications, view delivery reports.
-- Every tenant-scoped endpoint checks **both** the caller's role (`@PreAuthorize`) **and** that the
-  authenticated user's own `tenantId` matches the tenant in the URL (`TenantAccessGuard`) — role
-  alone can't stop one tenant admin from reading another tenant's data.
+In short: a `@Scheduled` poller claims due work per-tenant (for fairness) via row-level locking (for
+safety), dispatches across four bounded per-channel thread pools, retries transient failures with
+capped exponential backoff, and persists every attempt as an audit trail — all backed by two
+independent duplicate-delivery safeguards (idempotency keys for client retries, safe row-claiming
+for internal retries).
 
 ## API reference
 
