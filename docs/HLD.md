@@ -14,7 +14,22 @@ original requirement.
 | **Platform admin** | Create/suspend tenants, create tenant-admin accounts, set the platform-wide default rate limit. |
 | **Tenant admin** | Manage their own tenant's templates and channel configs, set a rate-limit override (capped at the platform default), send notifications, view delivery reports. Scoped strictly to their own tenant. |
 
-## 3. System context
+## 3. Entities (domain model)
+
+| Entity | Purpose |
+|---|---|
+| **Tenant** | A customer organization. `ACTIVE` or `SUSPENDED`. |
+| **AppUser** | A login account. `PLATFORM_ADMIN` (no tenant) or `TENANT_ADMIN` (belongs to exactly one tenant). |
+| **NotificationTemplate** | Tenant-owned. A channel plus a subject/body containing `{{variable}}` placeholders. |
+| **ChannelConfig** | Tenant-owned. Per-channel enabled flag and a simulated provider name — a tenant must have one of these, enabled, before it can send through that channel. |
+| **GlobalRateLimitConfig** | Single-row table holding the platform-wide default requests/sec. |
+| **TenantRateLimit** | Optional per-tenant override of the global default (capped at it, never above). |
+| **NotificationRequest** | One logical send: tenant, channel, recipient, rendered content, idempotency key, status, and retry bookkeeping (`attemptCount`, `maxAttempts`, `nextAttemptAt`). |
+| **DeliveryAttempt** | One attempt at delivering a `NotificationRequest` — outcome, error, timestamp. Append-only; this is the audit trail. |
+
+Exact column-level schema (types, constraints, foreign keys) is in [`LLD.md`](LLD.md) §1.
+
+## 4. System context
 
 Single-instance Spring Boot application, single PostgreSQL database. No external message broker,
 no distributed cache, no real third-party channel providers — all explicitly out of scope for this
@@ -46,7 +61,7 @@ Client  ────────────────────────
                           (bounded executors, one per channel)
 ```
 
-## 4. Major components
+## 5. Major components
 
 | Component | Responsibility |
 |---|---|
@@ -59,7 +74,7 @@ Client  ────────────────────────
 | **`SecurityConfig` / `CustomUserDetailsService` / `AppUserPrincipal`** | Stateless HTTP Basic auth backed by the `AppUser` table, BCrypt-hashed passwords, CSRF disabled (no cookie session to forge). |
 | **`DataSeeder`** | One-time bootstrap: creates the first platform-admin account and default rate limit on a fresh database, solving the chicken-and-egg problem of needing an admin to create the first admin. |
 
-## 5. Core data flow: sending a notification
+## 6. Core data flow: sending a notification
 
 1. Tenant admin `POST`s to `/api/tenants/{tenantId}/notifications` with a template ID, recipient,
    variables, optional `scheduledAt`, and a client-supplied `idempotencyKey`.
@@ -74,7 +89,7 @@ Client  ────────────────────────
 5. The tenant admin can poll `GET .../notifications/{id}` at any time to see current status and the
    full attempt history — this is the delivery report.
 
-## 6. Dispatch, concurrency & fairness (high level)
+## 7. Dispatch, concurrency & fairness (high level)
 
 Every 2 seconds, one scheduled task:
 
@@ -89,7 +104,7 @@ mechanism: a tenant that enqueues a huge burst can never claim more than its own
 share, so it can't crowd out other tenants in the same poll cycle. Full algorithmic detail
 (the SQL, the token-bucket math, the backoff formula) is in [`LLD.md`](LLD.md).
 
-## 7. Non-functional decisions
+## 8. Non-functional decisions
 
 | Concern | Decision | Why |
 |---|---|---|
@@ -97,11 +112,11 @@ share, so it can't crowd out other tenants in the same poll cycle. Full algorith
 | Fairness | Per-tenant claim batching | Simple to reason about, directly addresses "per-tenant fairness under load." |
 | Rate limiting | In-memory token bucket per tenant | Single-instance app (distributed systems explicitly out of scope) — no need for a shared/distributed limiter. |
 | Retries | Exponential backoff, capped, persisted attempt history | Matches "retries with backoff" and "audit trail" requirements directly. |
-| Duplicate prevention | Idempotency key (client-facing) + SKIP LOCKED claiming (internal) | Two different duplication risks, two different mechanisms — see `LLD.md` §5. |
+| Duplicate prevention | Idempotency key (client-facing) + SKIP LOCKED claiming (internal) | Two different duplication risks, two different mechanisms — see `LLD.md` §6. |
 | Security | Stateless HTTP Basic + BCrypt + role/tenant checks | OAuth/SSO/MFA explicitly out of scope; this is the simplest mechanism that still enforces both roles correctly. |
 | Persistence | PostgreSQL, `ddl-auto=update` | Real DB needed for `SKIP LOCKED`; migrations tooling (Flyway/Liquibase) would be the next step for a longer-lived project. |
 
-## 8. Related documents
+## 9. Related documents
 
 - [`LLD.md`](LLD.md) — schema, algorithms, class-level detail.
 - [`plan.md`](plan.md) — original design plan and build order (historical, written before implementation).
